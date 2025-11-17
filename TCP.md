@@ -147,10 +147,153 @@ TCP 通过端口号识别应用层服务，并在主机间实现不同数据流�
 
 ## 建立一个连接
 
+“三次握手”是TCP建立连接的标准流程。该流程通常由一方 TCP 端点发起，另一方做出响应；即双方 TCP 端点同时发起连接（即“同时打开”场景），该流程依然有效。当同时打开时，每个 TCP 端点在发送 SYN 报文段后，会收到
+一个未携带确认信息（ACK）的 SYN 报文段。需注意，旧连接的重复 SYN 报文段若延迟到达，可能会让接收方误以为正在发生同时打开，而合理使用 “复位”（RST）报文段可有效区分这类场景，消除歧义。
+
+以下是几个连接建立的示例。尽管这些示例未展示使用 “携带数据的报文段” 进行连接同步的情况，但这种方式完全合法 —— 只要接收方 TCP 端点在确认数据有效前，不将数据交付给上层用户即可（例如，接收方会将数据缓存，
+直至连接进入 ESTABLISHED 状态。毕竟三次握手已降低了虚假连接的可能性）。这种机制本质是在 “内存开销” 与 “用于校验的报文交互开销” 之间进行权衡。
+  
+图 6 展示了最简单的三次握手（3WHS）流程。图表的解读规则如下：
+  
+```
+TCP Peer A                                             TCP Peer B
+1. CLOSED                                              LISTEN
+2. SYN-SENT --> <SEQ=100><CTL=SYN>                   --> SYN-RECEIVED
+3. ESTABLISHED <-- <SEQ=300><ACK=101><CTL=SYN,ACK>   <-- SYN-RECEIVED
+4. ESTABLISHED --> <SEQ=101><ACK=301><CTL=ACK>       --> ESTABLISHED
+5. ESTABLISHED --> <SEQ=101><ACK=301><CTL=ACK><DATA> --> ESTABLISHED
+```
+
+在图 6 的第 2 行中，TCP 端点 A 首先发送一个 SYN 报文段，表明其后续将使用以序列号 100 为起始的序列号空间；第 3 行中，TCP 端点 B 发送一个 SYN 报文段（同步自身序列号），同时对从 A 收到的 SYN 报文段进行确认。
+需注意：确认号字段的值表明 B 当前期望接收的下一个序列号为 101—— 这一确认行为对应的是 A 发送的、占用了序列号 100 的 SYN 报文段（因 SYN 标志位虽不携带数据，但会占用 1 个序列号）。
+
+在第 4 行中，TCP 端点 A 回复一个空报文段（无数据负载），其中包含对 TCP 端点 B 的 SYN 报文段的确认（ACK）；第 5 行中，TCP 端点 A 发送一段数据。需注意：第 5 行报文段的序列号与第 4 行相同 —— 因为 ACK 标志位
+本身不占用序列号空间（若 ACK 占用序列号，则会导致 “确认号的确认” 这一逻辑循环，引发协议混乱）。
+
+如图 7 所示，同时打开（Simultaneous Initiation）的流程仅略微复杂一些：每个 TCP 端点的连接状态均遵循 “CLOSED → SYN-SENT → SYN-RECEIVED → ESTABLISHED” 的循环路径演进。
+```
+TCP Peer A                                            TCP Peer B
+1. CLOSED                                             CLOSED
+2. SYN-SENT --> <SEQ=100><CTL=SYN>                    ...
+3. SYN-RECEIVED <-- <SEQ=300><CTL=SYN>                <-- SYN-SENT
+4. ... <SEQ=100><CTL=SYN>                             --> SYN-RECEIVED
+5. SYN-RECEIVED --> <SEQ=100><ACK=301><CTL=SYN,ACK>   ...
+6. ESTABLISHED <-- <SEQ=300><ACK=101><CTL=SYN,ACK>    <-- SYN-RECEIVED
+7. ... <SEQ=100><ACK=301><CTL=SYN,ACK>                --> ESTABLISHED
+```
+
+TCP 协议实现必须支持同时打开尝试（强制要求第 10 条，MUST-10）。需注意：TCP 协议实现必须记录连接进入 SYN-RECEIVED 状态的原因 —— 是源于被动打开（passive OPEN）还是主动打开（active OPEN）（强制要求第 11 条，MUST-11）。
+
+三次握手的核心目的是防止旧连接的重复连接请求引发混淆。为应对这一问题，TCP 协议定义了一种特殊的控制报文 —— 复位报文（reset，RST）。具体处理规则如下：
+
+1. 若接收方 TCP 端点处于非同步状态（即 SYN-SENT、SYN-RECEIVED），收到合法的 RST 报文后，会恢复至 LISTEN 状态；
+
+2. 若接收方处于同步状态（即 ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2、CLOSE-WAIT、CLOSING、LAST-ACK、TIME-WAIT），收到 RST 报文后，会终止当前连接，并通知应用层用户。
+下文将在 “半打开连接（half-open connections）” 部分详细讨论后一种情况。
+
+```          ddddddddddddddddddddddddddd                                                                                               
+TCP Peer A                                         TCP Peer B
+1. CLOSED                                              LISTEN
+2. SYN-SENT --> <SEQ=100><CTL=SYN>                                                                         ...
+3. (duplicate) ... <SEQ=90><CTL=SYN>               --> SYN-RECEIVED
+4. SYN-SENT <-- <SEQ=300><ACK=91><CTL=SYN,ACK>     <-- SYN-RECEIVED
+5. SYN-SENT --> <SEQ=91><CTL=RST>                  --> LISTEN
+6. ... <SEQ=100><CTL=SYN>                          --> SYN-RECEIVED
+7. ESTABLISHED <-- <SEQ=400><ACK=101><CTL=SYN,ACK> <-- SYN-RECEIVED
+8. ESTABLISHED --> <SEQ=101><ACK=401><CTL=ACK>     --> ESTABLISHED
+```
+
+第 3 行中，一个旧的重复 SYN 报文段到达 TCP 端点 B。由于 B 无法分辨该报文段是旧重复数据，因此按正常流程回复（第 4 行）；
+TCP 端点 A 检测到 B 回复的 ACK 字段不正确，于是返回一个 RST（复位）报文段，且特意选择了合理的 SEQ 字段以确保该 RST 能被 B 认可；
+B 收到 RST 后，恢复至 LISTEN 状态。当原始 SYN 报文段最终在第 6 行到达时，连接同步流程正常进行。若第 6 行的原始 SYN 早于 RST 到达 B
+，则可能出现更复杂的交互 —— 双方会互相发送 RST 报文段。
+
+## 半打开及其他异常场景
+
+若 TCP 连接的一端已关闭或终止连接，但另一端毫不知情，或因故障、重启导致两端内存丢失进而造成连接状态不同步，则该已建立的连接被称为 “半打开连接（half-open connection）”。
+此类连接若任何一方尝试发送数据，将自动触发复位（RST）机制。不过，半打开连接通常属于异常场景，并不常见。若端点 A 的连接已不存在（如已关闭或因重启丢失状态），而端点 B 的用
+户仍尝试通过该连接发送数据，则端点 B 的 TCP 协议栈会收到一个复位（RST）控制报文。该报文会告知 B 的 TCP 协议栈 “连接存在异常”，B 需终止该连接。
+
+假设用户进程 A 和 B 正在通信时，发生故障或重启导致 A 的 TCP 协议栈丢失内存（即丢失所有连接状态）。根据支撑 A 的 TCP 协议栈的操作系统特性，系统通常会存在某种错误恢复机制。
+当 A 的 TCP 端点重新启动后，进程 A 可能会从头开始执行，或从某个恢复点恢复运行。因此，A 大概率会尝试重新建立（OPEN）该连接，或试图向其认为仍处于打开状态的连接发送（SEND）数据；
+在后一种情况下，A 会从本地（A 的）TCP 协议栈收到 “连接未打开” 的错误提示（如 Linux 系统的ENOTCONN错误）。为建立连接，A 的 TCP 协议栈会发送一个携带 SYN 标志位的报文段。
+该场景对应图 9 所示的示例：TCP 端点 A 重启后，用户尝试重新建立连接，而此时 TCP 端点 B 仍认为原连接处于打开状态。
+
+```
+TCP Peer A                                     TCP Peer B
+ 1. (REBOOT)                              (send 300,receive 100)
+ 2. CLOSED                                     ESTABLISHED
+ 3. SYN-SENT --> <SEQ=400><CTL=SYN>        --> (??)
+ 4. (!!) <-- <SEQ=300><ACK=100><CTL=ACK>   <-- ESTABLISHED
+ 5. SYN-SENT --> <SEQ=100><CTL=RST>        --> (Abort!!)
+ 6. SYN-SENT                                   CLOSED
+ 7. SYN-SENT --> <SEQ=400><CTL=SYN>        -->
+```
+当 SYN 报文段在第 3 行到达时，TCP 端点 B 正处于同步状态（已建立连接），且该入站报文段的序列号落在接收窗口之外，因此 B 回复一个确认报文段，指明其接下来期望接收的序列号（确认号为 100）。
+TCP 端点 A 发现该确认报文段并未确认其发送的任何数据（A 刚重启，未发送过序列号 100 相关的数据），且自身处于非同步状态，因此检测到这是一个半打开连接，进而发送复位（RST）报文段。
+TCP 端点 B 在第 5 行收到 RST 后终止原连接。之后 TCP 端点 A 会继续尝试建立连接，此时问题已简化为图 6 所示的基础三次握手流程。
+
+另一种值得关注的情况是：TCP 端点 A 重启后，TCP 端点 B 仍试图向其认为处于同步状态的连接发送数据（如图 10 所示）。在该场景中，从 B 发送至 A 的数据流（第 2 行）因 A 侧不存在对应连接而被判定为无效，
+因此 A 发送一个 RST 报文段。B 接收的 RST 报文段合法，故处理该报文并终止原连接。
+
+```
+TCP Peer A                                                TCP Peer B
+1. (REBOOT)                                          (send 300,receive 100)
+2. (??) <-- <SEQ=300><ACK=100><DATA=10><CTL=ACK>        <-- ESTABLISHED
+3.      --> <SEQ=100><CTL=RST>                          --> (ABORT!!)
+```
+图 10
+
+图 11 描绘了两个 TCP 端点 A 和 B 均处于被动监听状态（等待 SYN 报文段）的场景。一个旧的重复报文段在第 2 行到达 TCP 端点 B，触发 B 的响应行为：B 返回一个 SYN-ACK 报文段（第 3 行），而该报文段导致 TCP 
+端点 A 生成一个 RST（复位）报文段 —— 因第 3 行的确认号（ACK）对 A 而言是无效的。TCP 端点 B 接收并认可该 RST，随后恢复至被动监听（LISTEN）状态。
+```
+TCP Peer A                                         TCP Peer B
+1. LISTEN                                          LISTEN
+2. ... <SEQ=Z><CTL=SYN> --> SYN-RECEIVED
+3. (??) <-- <SEQ=X><ACK=Z+1><CTL=SYN,ACK>     <-- SYN-RECEIVED
+4. --> <SEQ=Z+1><CTL=RST>                     --> (return to LISTEN!)
+5. LISTEN                                         LISTEN
+```
+图 11
+
+TCP 协议还存在多种其他可能的异常场景，但所有场景均可通过以下关于复位（RST）报文段生成与处理的核心规则来覆盖（即所有异常均能通过这些规则解决）。
+
+### 复位报文生成机制
+
+TCP 用户或应用程序可在连接生命周期的任意时刻发起复位（RST）；此外，如后文所述，当各类错误条件发生时，TCP 协议本身也会自动生成复位事件。
+
+发起复位的连接端应进入 TIME-WAIT 状态 —— 如前文所述，这一设计通常有助于减轻高负载服务器的压力。
+核心规则如下：当收到的报文段明显不属于当前连接时，必须发送复位（RST）；若无法明确判定该报文段是否针对当前连接，则禁止发送 RST。
+
+TCP 连接状态可分为三大类：
+
+1. 若连接不存在（即处于 CLOSED 状态），则接收方会对所有入站报文段（除其他复位报文 RST 外）回复一个复位报文（RST）。通过这种方式，可拒绝任何与现有连接不匹配的 SYN 报文段（即无对应监听端口或无匹配连接的 SYN 请求）。
+
+   若入站报文段设置了 ACK 标志位，则复位报文（RST）的序列号取自该报文段的 ACK 字段；否则，RST 的序列号设为 0，且其 ACK 字段设为入站报文段的序列号与报文段长度之和。连接始终保持 CLOSED 状态。
+
+2. 若连接处于任一非同步状态（LISTEN、SYN-SENT、SYN-RECEIVED），且入站报文段确认了未发送的数据（即携带无效 ACK），或入站报文段的安全级别 / 隔离域（见附录 A.1）与连接请求的安全级别 / 隔离域不完全匹配，则发送 RST。
+
+   若入站报文段设置了 ACK 标志位，则 RST 的序列号取自该报文段的 ACK 字段；否则，RST 的序列号设为 0，且其 ACK 字段设为入站报文段的序列号与报文段长度之和。连接保持原状态不变。
+
+3. 若连接处于同步状态（ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2、CLOSE-WAIT、CLOSING、LAST-ACK、TIME-WAIT），则任何无效报文段（序列号落在窗口外或确认号无效）都必须以空确认报文段（无用户数据）响应 —— 该确认报文段包含当前发送序列号和期望接收的下一个序列号，连接保持原状态不变。
+
+   若入站报文段的安全级别 / 隔离域与连接请求的安全级别 / 隔离域不完全匹配，则发送 RST 并将连接置为 CLOSED 状态。RST 的序列号取自入站报文段的 ACK 字段。
+
+### 复位报文处理
+
+除 SYN-SENT 状态外，所有状态下收到的复位（RST）报文段都需通过校验其序列号（SEQ 字段）验证合法性：若 RST 的序列号落在当前接收窗口内，则判定为合法。处于 SYN-SENT 状态时（收到针对初始 SYN 的 RST 响应），若 RST 的确认号（ACK 字段）能确认该 SYN（即 ACK 字段等于 SYN 的序列号 + 1），则该 RST 可被接受。
+RST 的接收方需先验证其合法性，再执行状态变迁：
+1. 若接收方处于 LISTEN 状态，直接忽略该 RST；
+
+3. 若接收方处于 SYN-RECEIVED 状态，且此前处于 LISTEN 状态（被动打开场景），则恢复至 LISTEN 状态；否则（主动打开场景，如同时打开），终止连接并进入 CLOSED 状态；
+   
+5. 若接收方处于其他任何状态，终止连接、通知应用层用户，并进入 CLOSED 状态。
+   
+TCP 协议实现允许接收的 RST 报文段携带数据（建议性要求第 2 条，SHLD-2）。有观点认为，RST 可包含诊断数据以说明复位原因，但目前尚未针对此类数据制定统一标准。
+
+## 关闭连接
 
 
 
-  
-  
-  
-  
+
+
